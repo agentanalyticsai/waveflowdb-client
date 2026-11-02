@@ -16,7 +16,6 @@ A Python client library for [WaveflowDB](https://db.agentanalytics.ai/)
 - **Semantic search:** Retrieve relevant content using natural-language queries.
 - **VQL:** Perform targeted retrieval with structured filtering.
 - **Document management:** Add, update, refresh, insert, and delete documents.
-- **Custom metadata:** Attach application-specific attributes to documents.
 - **Document processing:** Support for multiple file formats and optional OCR integrations.
 - **Reliable ingestion:** Batch processing, resumable uploads, and change detection.
 
