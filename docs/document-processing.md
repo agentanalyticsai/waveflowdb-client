@@ -12,9 +12,6 @@ The following table summarizes the supported formats and their intended processi
 | `.pdf` | Extract text and optionally apply OCR to images. |
 | `.docx` | Extract text and inline images, with optional OCR. |
 | `.csv` | Split records while preserving column headers. |
-| `.xlsx` | Convert workbook content into a structured, CSV-like representation. |
-| `.jsonl` | Process individual records and validate JSON lines. |
-| `.json` | Process structured JSON content; atomic handling may depend on the implementation. |
 | `.png`, `.jpg`, `.jpeg` | Extract text from images using OCR. |
 
 Unsupported formats may be skipped or rejected during ingestion, depending on the implementation.
