@@ -50,11 +50,13 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import io
 import json
 import logging
 import os
 import re as _re
 import shutil
+import sys
 import time as _time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -67,6 +69,10 @@ from .exceptions import FileProcessingError, UnsupportedFileTypeError
 from .models import VersionedChunkName
 
 logger = logging.getLogger(__name__)
+
+# csv.reader refuses any single field > 128 KB by default; lift it so big cells
+# reach the chunker (which handles oversized rows explicitly) instead of failing.
+csv.field_size_limit(min(sys.maxsize, 2**31 - 1))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -329,45 +335,159 @@ _BLOCK_RE = _re.compile(
 )
 
 
+# The server limits the HTTP request body, not the chunk file. The client sends
+# chunk text inside a JSON body (requests.post(json=...) -> ensure_ascii=True),
+# so a chunk's cost is its JSON-ENCODED size: "\n" becomes 2 bytes, '"' becomes
+# 2, non-ASCII becomes 6+. Every size in this module is measured that way.
+# The encoded size is always >= the raw UTF-8 size, so file size <= limit too.
+_WIRE_BASE_RESERVE     = 2048   # request-body fields outside the file texts
+_WIRE_PER_FILE_RESERVE = 1024   # per-file name/meta/timestamp + JSON punctuation
+
+
+def _blen(s: str) -> int:
+    """Size of *s* as it appears inside the JSON request body, in bytes."""
+    return len(json.dumps(s)) - 2          # minus the surrounding quotes
+
+
+def _char_wire(c: str) -> int:
+    """JSON-encoded size of one character (matches json.dumps, ensure_ascii=True)."""
+    o = ord(c)
+    if o < 0x20:
+        return 2 if c in "\n\r\t\b\f" else 6
+    if c == '"' or c == "\\":
+        return 2
+    if o <= 0x7F:
+        return 1
+    return 6 if o <= 0xFFFF else 12
+
+
+def _chunk_wire_size(path) -> int:
+    """JSON-encoded size of a chunk file, read the same way the client reads it."""
+    return _blen(Path(path).read_text(encoding="utf-8", errors="replace"))
+
+
+def _hard_split_text(s: str, limit: int) -> List[str]:
+    """
+    Last-resort split of *s* into pieces whose JSON-encoded size is at most
+    *limit* bytes. Splits between characters, so multi-byte characters are
+    never cut in half.
+    """
+    limit = max(limit, 12)             # widest single character (astral pair)
+    out: List[str] = []
+    start, used = 0, 0
+    for i, c in enumerate(s):
+        w = _char_wire(c)
+        if used + w > limit:
+            out.append(s[start:i])
+            start, used = i, 0
+        used += w
+    if start < len(s):
+        out.append(s[start:])
+    return out
+
+
+def _text_units(text: str, limit: int):
+    """
+    Yield ``(unit, sep)`` pairs, each unit guaranteed <= *limit* bytes.
+    *sep* is the separator that precedes the unit when it is appended to a
+    chunk that already has content.
+
+    Degrades in levels so nothing ever exceeds the limit:
+        paragraph (blank-line separated)  ->  line  ->  hard byte split
+    """
+    for para in text.split("\n\n"):
+        para = para.strip()
+        if not para:
+            continue
+        if _blen(para) <= limit:
+            yield para, "\n\n"
+            continue
+        first = True
+        for line in para.split("\n"):
+            lsep = "\n\n" if first else "\n"
+            first = False
+            if _blen(line) <= limit:
+                yield line, lsep
+            else:
+                for k, piece in enumerate(_hard_split_text(line, limit)):
+                    yield piece, (lsep if k == 0 else "")
+
+
+_BLOCK_PARTS_RE = _re.compile(
+    r'^(<<<IMAGE_EXTRACT[^>]*>>>)\n?(.*?)\n?(<<<END_IMAGE_EXTRACT>>>)$', _re.DOTALL,
+)
+
+
+def _pack_units(units, limit: int) -> List[str]:
+    """Greedy-pack ``(unit, sep)`` pairs into chunks of <= *limit* bytes."""
+    chunks: List[str] = []
+    cur: List[str] = []
+    cur_b = 0
+    for unit, sep in units:
+        ub = _blen(unit)
+        sb = _blen(sep) if cur else 0
+        if cur and cur_b + sb + ub > limit:
+            chunks.append("".join(cur))
+            cur, cur_b, sb = [], 0, 0
+        if cur:
+            cur.append(sep)
+        cur.append(unit)
+        cur_b += sb + ub
+    if cur:
+        chunks.append("".join(cur))
+    return chunks
+
+
+def _block_units(block: str, limit: int):
+    """
+    Units for one IMAGE_EXTRACT block. A block that fits stays whole. One that
+    doesn't is split on its inner OCR text and every piece is re-wrapped in its
+    own open/close markers, so provenance survives and each piece still fits.
+    """
+    if _blen(block) <= limit:
+        yield block, "\n\n"
+        return
+    m = _BLOCK_PARTS_RE.match(block)
+    if m:
+        open_m, inner, close_m = m.groups()
+        budget = limit - (_blen(open_m) + _blen(close_m) + _blen("\n\n"))
+        if budget >= 64:
+            for piece in _pack_units(_text_units(inner, budget), budget):
+                yield f"{open_m}\n{piece}\n{close_m}", "\n\n"
+            return
+    for piece in _hard_split_text(block, limit):      # degenerate marker: plain split
+        yield piece, "\n\n"
+
+
 def paragraph_chunk(text: str, max_chars: int) -> List[str]:
     """
-    Split text on blank lines.
+    Split *text* into chunks whose JSON-encoded size is AT MOST *max_chars*
+    bytes (a hard limit — the name is historical; it is a byte budget).
 
-    Image-origin markers are kept together with their content: the chunker
-    never splits inside a marker block so provenance is preserved across all
-    output chunk files.
-
-    NOTE: max_chars is treated as a UTF-8 byte limit (not a character count)
-    so that on-disk chunk sizes are guaranteed to stay under the batch limit.
+    Splitting degrades in levels — blank-line paragraphs, then lines, then a
+    hard byte split on a character boundary — so a single huge paragraph, a
+    log with no blank lines, or a one-line dump can no longer produce an
+    oversized chunk. IMAGE_EXTRACT blocks are kept whole when they fit;
+    oversized ones are split with markers re-wrapped on every piece.
     """
-    segments = _BLOCK_RE.split(text)
-    paragraphs: List[str] = []
+    def _all_units():
+        for seg in _BLOCK_RE.split(text):
+            if _BLOCK_RE.fullmatch(seg):
+                yield from _block_units(seg.strip(), max_chars)
+            else:
+                yield from _text_units(seg, max_chars)
 
-    for seg in segments:
-        if _BLOCK_RE.fullmatch(seg):
-            paragraphs.append(seg.strip())
-        else:
-            for p in seg.split("\n\n"):
-                if p.strip():
-                    paragraphs.append(p.strip())
+    return _pack_units(_all_units(), max_chars) or [text]
 
-    chunks: List[str] = []
-    current: List[str] = []
-    current_bytes = 0
 
-    for para in paragraphs:
-        para_bytes = len(para.encode("utf-8")) + 2  # +2 for "\n\n" separator
-        if current and current_bytes + para_bytes > max_chars:
-            chunks.append("\n\n".join(current))
-            current = []
-            current_bytes = 0
-        current.append(para)
-        current_bytes += para_bytes
-
-    if current:
-        chunks.append("\n\n".join(current))
-
-    return chunks or [text]
+def _csv_row_bytes(row) -> bytes:
+    """
+    Serialize one row exactly as it will appear on disk: real CSV quoting,
+    "\\n" terminator (no CRLF), UTF-8. len() of this IS the on-disk size.
+    """
+    buf = io.StringIO()
+    csv.writer(buf, lineterminator="\n").writerow(row)
+    return buf.getvalue().encode("utf-8")
 
 
 def _split_csv_safe(
@@ -376,7 +496,16 @@ def _split_csv_safe(
     chunks_dir: Path,
     base_chunk_name_fn,
 ) -> List[str]:
-    """Split a CSV by rows; never break a row across chunks."""
+    """
+    Split a CSV by rows into chunk files of AT MOST *safe_limit* bytes.
+
+    Sizes are measured as JSON-encoded bytes of the exact text that gets
+    written (header, quoting and terminators included), which is what the
+    request body carries; chunks are written with write_bytes() so the file
+    itself is never larger than that. A row that can't fit even
+    alone (header + row > limit) is split as plain text pieces with a warning
+    rather than aborting the whole file.
+    """
     p = Path(file_path)
     output_files: List[str] = []
 
@@ -397,34 +526,52 @@ def _split_csv_safe(
         except StopIteration:
             raise FileProcessingError(f"CSV file is empty: {file_path}")
 
-        header_bytes = len(",".join(header).encode("utf-8"))
-        part, rows, current_size = 1, [], header_bytes
+        header_b = _csv_row_bytes(header)
+        header_w = _blen(header_b.decode("utf-8"))
+        if header_w >= safe_limit:
+            raise FileProcessingError(
+                f"CSV header alone ({header_w} bytes) exceeds safe limit ({safe_limit} bytes)"
+            )
+
+        part = 1
+        buf: List[bytes] = []
+        size = header_w
+
+        def _emit(data: bytes) -> None:
+            nonlocal part
+            out = chunks_dir / base_chunk_name_fn(part)
+            out.write_bytes(data)
+            output_files.append(str(out))
+            part += 1
+
+        def _flush() -> None:
+            nonlocal buf, size
+            if buf:
+                _emit(header_b + b"".join(buf))
+            buf, size = [], header_w
 
         for row in reader:
-            try:
-                row_bytes = len(",".join(row).encode("utf-8"))
-            except Exception:
+            rb = _csv_row_bytes(row)
+            rw = _blen(rb.decode("utf-8"))
+
+            if header_w + rw > safe_limit:
+                # Row can't fit even alone — keep the data, split as text.
+                _flush()
+                logger.warning(
+                    "CSV row of %d bytes in %s exceeds the %d-byte limit — "
+                    "splitting it into text pieces (header not repeated).",
+                    len(rb), p.name, safe_limit,
+                )
+                for piece in _hard_split_text(rb.decode("utf-8"), safe_limit):
+                    _emit(piece.encode("utf-8"))
                 continue
 
-            if row_bytes > safe_limit:
-                raise FileProcessingError(
-                    f"A single CSV row exceeds safe limit ({safe_limit} bytes)"
-                )
+            if size + rw > safe_limit:
+                _flush()
+            buf.append(rb)
+            size += rw
 
-            if current_size + row_bytes > safe_limit and rows:
-                out = chunks_dir / base_chunk_name_fn(part)
-                _write_csv(out, header, rows)
-                output_files.append(str(out))
-                part += 1
-                rows, current_size = [], header_bytes
-
-            rows.append(row)
-            current_size += row_bytes
-
-        if rows:
-            out = chunks_dir / base_chunk_name_fn(part)
-            _write_csv(out, header, rows)
-            output_files.append(str(out))
+        _flush()
 
     return output_files
 
@@ -741,6 +888,11 @@ class BatchManager:
         self.max_files    = max_files
         # CHANGED: int() cast so downstream byte-math stays integer arithmetic
         self.max_bytes    = int(max_size_mb * 1024 * 1024)
+        # max_bytes bounds the whole request body. Reserve room for the fields
+        # outside the chunk texts, then for each file's name/meta overhead.
+        self.per_file_reserve = min(_WIRE_PER_FILE_RESERVE, self.max_bytes // 32)
+        self.batch_budget = self.max_bytes - min(_WIRE_BASE_RESERVE, self.max_bytes // 16)
+        self.chunk_budget = self.batch_budget - self.per_file_reserve
         self.enable_ocr   = enable_ocr
         self.file_processor = FileProcessor(
             allowed_extensions,
@@ -783,7 +935,7 @@ class BatchManager:
         WARNING — extraction failure with exception type and message
         """
         t_total_start = _time.monotonic()
-        safe_limit = self.max_bytes
+        safe_limit = self.chunk_budget
         ext = src.suffix.lstrip(".").lower()
         file_info: List[Tuple[str, int]] = []
 
@@ -792,6 +944,21 @@ class BatchManager:
             "[extract] START  '%s'  size=%.1f KB  ext=%s",
             fname, src_bytes / 1024, ext,
         )
+
+        # Chunks cached by an older run (or an older chunker) may exceed the
+        # limit. Purge ALL of this file's chunks so they are regenerated as a
+        # consistent set rather than half-reused.
+        _stale = [
+            c for c in chunks_dir.glob(f"{src.stem}_part*.txt")
+            if _chunk_wire_size(c) > safe_limit
+        ]
+        if _stale:
+            logger.warning(
+                "'%s': %d cached chunk(s) exceed %d bytes — regenerating all chunks.",
+                fname, len(_stale), safe_limit,
+            )
+            for c in chunks_dir.glob(f"{src.stem}_part*.txt"):
+                c.unlink(missing_ok=True)
 
         def _chunk_name(part: int, _fname=fname) -> str:
             return VersionedChunkName.build(_fname, part=part).filename
@@ -900,7 +1067,9 @@ class BatchManager:
                     cname = _chunk_name(i)
                     dst = chunks_dir / cname
                     if not dst.exists() or dst.stat().st_size == 0:
-                        dst.write_text(chunk_text, encoding="utf-8")
+                        # write_bytes: no "\n"->"\r\n" translation on Windows, so
+                        # on-disk size == the size the chunker measured.
+                        dst.write_bytes(chunk_text.encode("utf-8"))
                         newly_written += 1
                     file_info.append((str(dst), dst.stat().st_size))
                 logger.debug(
@@ -938,6 +1107,20 @@ class BatchManager:
                         )
                         newly_written += 1
                     file_info.append((str(dst), dst.stat().st_size))
+
+            # Report each chunk at its request-body cost (JSON-encoded size plus
+            # per-file overhead) — this is what batch packing must add up.
+            file_info = [
+                (p, _chunk_wire_size(p) + self.per_file_reserve) for p, _ in file_info
+            ]
+
+            # ── Invariant: no chunk may exceed the limit ──────────────────────
+            if ext == "csv" or ext in _TEXT_LIKE:
+                _oversize = [(Path(p).name, sz) for p, sz in file_info if sz > self.batch_budget]
+                if _oversize:
+                    raise FileProcessingError(
+                        f"Chunker produced chunk(s) over {self.batch_budget} bytes: {_oversize}"
+                    )
 
         except Exception as exc:
             logger.warning(
@@ -1064,7 +1247,7 @@ class BatchManager:
 
         for abs_path, size in file_info:
             name = Path(abs_path).name
-            if size > self.max_bytes:
+            if size > self.batch_budget:
                 logger.warning(
                     "Skipping chunk '%s' (%d bytes) — exceeds max batch size (%d bytes). "
                     "Increase max_batch_size_mb in Config to include this file.",
@@ -1073,7 +1256,7 @@ class BatchManager:
                 continue
             if current_batch and (
                 len(current_batch) >= self.max_files
-                or current_size + size > self.max_bytes
+                or current_size + size > self.batch_budget
             ):
                 batches.append(current_batch)
                 current_batch, current_size = [], 0
@@ -1164,8 +1347,11 @@ class BatchManager:
             # Fast-path: chunks already on disk
             stem = src.stem
             existing = sorted(chunks_dir.glob(f"{stem}_part*.txt"), key=lambda p: p.name)
-            if existing:
-                chunks = [(str(p), p.stat().st_size) for p in existing]
+            # Oversized cached chunks (older run/chunker) are not a valid cache
+            # hit — fall through so _extract_file_to_chunks regenerates them.
+            sized = [(str(p), _chunk_wire_size(p) + self.per_file_reserve) for p in existing]
+            if existing and all(sz <= self.batch_budget for _, sz in sized):
+                chunks = sized
                 logger.debug("cache-hit '%s'  %d chunk(s)", fname, len(chunks))
             else:
                 chunks = self._extract_file_to_chunks(fname, src, chunks_dir)
@@ -1188,9 +1374,15 @@ class BatchManager:
             current_size = 0
             for abs_path, size in interleaved:
                 name = Path(abs_path).name
+                if size > self.batch_budget:
+                    logger.warning(
+                        "Skipping chunk '%s' (%d bytes) — exceeds max batch size (%d bytes).",
+                        name, size, self.max_bytes,
+                    )
+                    continue
                 if current_batch and (
                     len(current_batch) >= self.max_files
-                    or current_size + size > self.max_bytes
+                    or current_size + size > self.batch_budget
                 ):
                     batches.append(current_batch)
                     current_batch, current_size = [], 0

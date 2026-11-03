@@ -26,7 +26,7 @@ client = VectorLake(
 | `VECTOR_LAKE_PATH` | `upload` | Directory containing source files |
 | `VECTOR_LAKE_LOG_DIR` | `logs` | Directory for log files |
 | `VECTOR_LAKE_MAX_FILES_PER_BATCH` | `100` | Maximum chunk files per upload batch |
-| `VECTOR_LAKE_MAX_BATCH_SIZE_MB` | `1` | Maximum total batch size in MB |
+| `VECTOR_LAKE_MAX_BATCH_SIZE_MB` | `0.5` | Maximum total batch size in MiB (0.5 = 524,288 bytes) |
 | `VECTOR_LAKE_TIMEOUT` | `240` | HTTP request timeout in seconds |
 | `VECTOR_LAKE_MAX_RETRIES` | `2` | Retry attempts on transient errors |
 | `VECTOR_LAKE_ENABLE_OCR` | `true` | Enable local Tesseract OCR |
