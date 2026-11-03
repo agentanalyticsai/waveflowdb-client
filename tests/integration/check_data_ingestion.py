@@ -4,7 +4,7 @@ $env:WAVEFLOWDB_API_KEY = "your-api-key-here"
 $env:WAVEFLOWDB_USER_ID = "your-user-email-here"
 
 run:
-    python -m tests.smoke_test
+    python -m tests.integration.check_data_ingestion
 """
 
 import json
