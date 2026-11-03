@@ -5,7 +5,7 @@ $env:WAVEFLOWDB_USER_ID = "your-user-email-here"
 $env:WAVEFLOWDB_HOST    = "https://waveflow-analytics.com"  
 
 run:
-    python -m tests.smoke_test
+    python -m tests.integration.check_all_features
 """
 
 import json
